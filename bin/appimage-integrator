@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# appimage-integrator: install AppImages so they behave like regular apps.
+#
+# It moves the AppImage into ~/Applications, pulls the real name, icon,
+# categories and launch arguments out of the AppImage itself, and writes a
+# launcher entry (with an "Uninstall" action) so the app shows up in your
+# app launcher. Removing it undoes all of that and sends the file to the trash.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+APPS_DIR="${APPIMAGE_DIR:-$HOME/Applications}"
+DESKTOP_DIR="$DATA_HOME/applications"
+ICON_DIR="$DATA_HOME/appimage-integrator/icons"
+PREFIX="appimage-"
+MARKER="X-AppImage-Integrated-By=appimage-integrator"
+
+NOTIFY=0
+CONFIRM=0
+COPY=0
+KEEP_FILE=0
+NOTIFY_ID=""
+WORKDIRS=()
+cleanup() { ((${#WORKDIRS[@]})) && rm -rf "${WORKDIRS[@]}"; return 0; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- output ---
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B="" D="" R="" G="" Y="" C="" N=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C" "$N" "$*"; }
+ok()   { printf '%s ✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s !%s %s\n' "$Y" "$N" "$*" >&2; }
+
+# Desktop notification, replacing the previous one so progress stays in a
+# single bubble. Only used when --notify is given (the Files menu does this).
+notify() {
+  local urgency="$1" icon="$2" title="$3" body="${4:-}"
+  ((NOTIFY)) || return 0
+  command -v notify-send >/dev/null || return 0
+  local args=(-a "AppImage Integrator" -u "$urgency" -i "$icon" -p)
+  [[ -n "$NOTIFY_ID" ]] && args+=(-r "$NOTIFY_ID")
+  NOTIFY_ID="$(notify-send "${args[@]}" "$title" "$body" 2>/dev/null || true)"
+}
+
+die() {
+  printf '%s ✗%s %s\n' "$R" "$N" "$*" >&2
+  notify critical dialog-error "AppImage Integrator" "$*"
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+${B}appimage-integrator${N} $VERSION
+Install AppImages so they show up in your app launcher like any other app.
+
+${B}Usage${N}
+  appimage-integrator install [--copy] <file.AppImage>...
+  appimage-integrator remove  [--keep-file] [--confirm] <file|name>...
+  appimage-integrator list
+  appimage-integrator info    <file.AppImage>
+  appimage-integrator run     <file.AppImage> [args...]
+
+${B}Options${N}
+  --copy        copy the AppImage instead of moving it into $APPS_DIR
+  --keep-file   on remove, leave the AppImage file in place
+  --confirm     ask before removing (graphical dialog when available)
+  --notify      report progress with desktop notifications
+  -h, --help    show this help
+  -v, --version show the version
+
+${B}Environment${N}
+  APPIMAGE_DIR  where AppImages are kept (default: ~/Applications)
+EOF
+}
+
+# --------------------------------------------------------------- helpers ---
+
+is_appimage() {
+  local f="$1" magic
+  [[ -f "$f" ]] || return 1
+  # Type 1 and 2 AppImages carry "AI" + type byte at offset 8 of the ELF.
+  magic="$(od -An -tx1 -j8 -N3 "$f" 2>/dev/null | tr -d ' \n')"
+  [[ "$magic" == "414901" || "$magic" == "414902" ]] && return 0
+  [[ "${f,,}" == *.appimage ]]
+}
+
+slugify() {
+  local s="${1,,}"
+  s="$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  printf '%s' "${s:-app}"
+}
+
+# Guess a readable name from a filename like "Kopuz_0.67.1_x86_64.AppImage".
+name_from_filename() {
+  local base
+  base="$(basename "$1")"
+  base="${base%.[Aa]pp[Ii]mage}"
+  base="$(printf '%s' "$base" | sed -E 's/[-_. ]?(x86[-_]64|amd64|aarch64|arm64|i[3-6]86|linux)//gI; s/[-_ ]v?[0-9]+(\.[0-9]+)+.*$//')"
+  printf '%s' "${base:-$(basename "$1")}"
+}
+
+# Pull "0.67.1" out of a filename like "Kopuz_0.67.1_x86_64.AppImage".
+version_from_filename() {
+  basename "$1" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true
+}
+
+# Read a key from the [Desktop Entry] group of a .desktop file.
+desktop_get() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  awk -v key="$key" '
+    /^\[/ { in_entry = ($0 == "[Desktop Entry]"); next }
+    in_entry && index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+  ' "$file"
+}
+
+# Quote a path for an Exec= line (spec: double quotes, escape " ` $ \).
+exec_quote() {
+  local s="$1"
+  s="${s//\\/\\\\\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\`/\\\`}"
+  s="${s//\$/\\\$}"
+  printf '"%s"' "$s"
+}
+
+# Find the launcher entry that belongs to an installed AppImage path or name.
+find_entry() {
+  local target="$1" real="" f
+  [[ -e "$target" ]] && real="$(readlink -f "$target")"
+  for f in "$DESKTOP_DIR"/"$PREFIX"*.desktop; do
+    [[ -f "$f" ]] || continue
+    grep -qx "$MARKER" "$f" || continue
+    if [[ -n "$real" && "$(desktop_get "$f" X-AppImage-Path)" == "$real" ]]; then
+      printf '%s' "$f"; return 0
+    fi
+    if [[ -z "$real" ]]; then
+      local id="${f##*/}"; id="${id#"$PREFIX"}"; id="${id%.desktop}"
+      if [[ "$id" == "$(slugify "$target")" || "$(desktop_get "$f" Name)" == "$target" ]]; then
+        printf '%s' "$f"; return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# Extract one path from the AppImage, following symlinks inside the image
+# (desktop files and icons at the top level are usually links into usr/share).
+# Prints the real extracted file, or nothing.
+pull() {
+  local img="$1" work="$2" rel="${3#/}" root="$2/squashfs-root" hops=0 target
+  while ((hops++ < 8)); do
+    if [[ ! -e "$root/$rel" && ! -L "$root/$rel" ]]; then
+      (cd "$work" && "$img" --appimage-extract "$rel" >/dev/null 2>&1) || true
+    fi
+    if [[ -L "$root/$rel" ]]; then
+      target="$(readlink "$root/$rel")"
+      if [[ "$target" == /* ]]; then
+        rel="${target#/}"
+      else
+        rel="$(realpath -m -s --relative-to="$root" "$root/$(dirname "$rel")/$target")"
+      fi
+    elif [[ -f "$root/$rel" ]]; then
+      printf '%s' "$root/$rel"; return 0
+    else
+      return 0
+    fi
+  done
+}
+
+# Extract the embedded .desktop file and the best icon into $2.
+# Prints "<desktop file>|<icon file>" (either may be empty).
+extract_metadata() {
+  local img="$1" work="$2" root desktop="" icon_name="" icon="" f best_size=0 size
+  root="$work/squashfs-root"
+
+  (cd "$work" && "$img" --appimage-extract '*.desktop' >/dev/null 2>&1) || true
+  if [[ -d "$root" ]]; then
+    f="$(find "$root" -maxdepth 1 -name '*.desktop' -print -quit)"
+    [[ -z "$f" ]] && f="$(find "$root" -name '*.desktop' -print -quit)"
+    [[ -n "$f" ]] && desktop="$(pull "$img" "$work" "${f#"$root"/}")"
+  fi
+  [[ -n "$desktop" ]] && icon_name="$(desktop_get "$desktop" Icon)"
+  icon_name="${icon_name##*/}"; icon_name="${icon_name%.png}"; icon_name="${icon_name%.svg}"
+
+  # Candidates: the AppImage's own .DirIcon, the named icon at the top level,
+  # and every size of the named icon under usr/share/icons.
+  local candidates=()
+  f="$(pull "$img" "$work" .DirIcon)"; [[ -n "$f" ]] && candidates+=("$f")
+  if [[ -n "$icon_name" ]]; then
+    for ext in svg png; do
+      f="$(pull "$img" "$work" "$icon_name.$ext")"; [[ -n "$f" ]] && candidates+=("$f")
+    done
+    (cd "$work" && "$img" --appimage-extract "usr/share/icons/*/$icon_name.*" >/dev/null 2>&1) || true
+    while IFS= read -r -d '' f; do
+      f="$(pull "$img" "$work" "${f#"$root"/}")"; [[ -n "$f" ]] && candidates+=("$f")
+    done < <(find "$root/usr/share/icons" -name "$icon_name.*" -print0 2>/dev/null)
+  fi
+
+  # Prefer a scalable icon, then the largest bitmap.
+  for f in "${candidates[@]}"; do
+    if [[ "$f" == *.svg ]] || file -L "$f" 2>/dev/null | grep -qi 'svg'; then icon="$f"; break; fi
+  done
+  if [[ -z "$icon" ]]; then
+    for f in "${candidates[@]}"; do
+      size="$(stat -Lc %s "$f" 2>/dev/null || echo 0)"
+      if ((size > best_size)); then best_size=$size; icon="$f"; fi
+    done
+  fi
+  printf '%s|%s\n' "$desktop" "$icon"
+}
+
+# --------------------------------------------------------------- install ---
+
+install_one() {
+  local src="$1" real work desktop icon name id dest entry exec_args
+  real="$(readlink -f "$src")" || die "Not found: $src"
+  is_appimage "$real" || die "$(basename "$src") is not an AppImage"
+
+  local fallback; fallback="$(name_from_filename "$real")"
+  notify normal system-software-install "Installing $fallback…" "Reading the app's name and icon"
+  info "Installing ${B}$(basename "$real")${N}"
+  chmod +x "$real"
+
+  work="$(mktemp -d)"; WORKDIRS+=("$work")
+  IFS='|' read -r desktop icon < <(extract_metadata "$real" "$work")
+
+  name="$(desktop_get "$desktop" Name)"; name="${name:-$fallback}"
+  id="$(slugify "$name")"
+  exec_args="$(desktop_get "$desktop" Exec)"
+  # Keep the app's own launch arguments (e.g. --no-sandbox %U), drop its binary name.
+  if [[ "$exec_args" == *" "* ]]; then exec_args="${exec_args#* }"; else exec_args="%U"; fi
+
+  # Replace an older install of the same app (an update), keeping one copy.
+  entry="$DESKTOP_DIR/$PREFIX$id.desktop"
+  local old_path=""
+  [[ -f "$entry" ]] && old_path="$(desktop_get "$entry" X-AppImage-Path)"
+
+  mkdir -p "$APPS_DIR" "$DESKTOP_DIR" "$ICON_DIR"
+  dest="$APPS_DIR/$(basename "$real")"
+  if [[ "$real" != "$dest" ]]; then
+    if ((COPY)); then cp -f "$real" "$dest"; else mv -f "$real" "$dest"; fi
+  fi
+  chmod +x "$dest"
+  if [[ -n "$old_path" && "$old_path" != "$dest" && -f "$old_path" ]]; then
+    gio trash "$old_path" 2>/dev/null || rm -f "$old_path"
+    info "Replaced older version ${D}$(basename "$old_path")${N}"
+  fi
+
+  local icon_value="application-x-executable"
+  if [[ -n "$icon" && -f "$icon" ]]; then
+    local ext="png"
+    [[ "$icon" == *.svg ]] && ext="svg"
+    if [[ "$ext" == png ]] && ! file -L "$icon" | grep -q PNG; then
+      file -L "$icon" | grep -qi svg && ext="svg"
+    fi
+    rm -f "$ICON_DIR/$id".{png,svg}
+    cp -L "$icon" "$ICON_DIR/$id.$ext"
+    icon_value="$ICON_DIR/$id.$ext"
+  else
+    warn "No icon found inside the AppImage, using a generic one"
+  fi
+
+  local version comment generic categories keywords mime wmclass terminal
+  version="$(desktop_get "$desktop" X-AppImage-Version)"
+  version="${version:-$(version_from_filename "$real")}"
+  comment="$(desktop_get "$desktop" Comment)"
+  generic="$(desktop_get "$desktop" GenericName)"
+  categories="$(desktop_get "$desktop" Categories)"
+  keywords="$(desktop_get "$desktop" Keywords)"
+  mime="$(desktop_get "$desktop" MimeType)"
+  wmclass="$(desktop_get "$desktop" StartupWMClass)"
+  terminal="$(desktop_get "$desktop" Terminal)"
+
+  {
+    echo "[Desktop Entry]"
+    echo "Type=Application"
+    echo "Name=$name"
+    [[ -n "$generic" ]] && echo "GenericName=$generic"
+    echo "Comment=${comment:-$name (AppImage)}"
+    echo "Exec=$(exec_quote "$dest") $exec_args"
+    echo "TryExec=$dest"
+    echo "Icon=$icon_value"
+    echo "Terminal=${terminal:-false}"
+    echo "Categories=${categories:-Utility;}"
+    [[ -n "$keywords" ]] && echo "Keywords=$keywords"
+    [[ -n "$mime" ]] && echo "MimeType=$mime"
+    [[ -n "$wmclass" ]] && echo "StartupWMClass=$wmclass"
+    echo "StartupNotify=true"
+    echo "Actions=Uninstall;"
+    echo "X-AppImage-Path=$dest"
+    [[ -n "$version" ]] && echo "X-AppImage-Version=$version"
+    echo "$MARKER"
+    echo
+    echo "[Desktop Action Uninstall]"
+    echo "Name=Uninstall $name"
+    echo "Icon=edit-delete"
+    echo "Exec=$(exec_quote "$SELF") remove --notify --confirm $(exec_quote "$dest")"
+  } >"$entry"
+  chmod 644 "$entry"
+
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$DESKTOP_DIR" 2>/dev/null || true
+
+  ok "${B}$name${N} ${version:+${D}v$version${N} }is in your app launcher"
+  printf '   %sfile%s  %s\n   %sentry%s %s\n' "$D" "$N" "$dest" "$D" "$N" "$entry"
+  notify normal "$icon_value" "$name installed" "Find it in your app launcher.${version:+ Version $version.}"
+}
+
+# ---------------------------------------------------------------- remove ---
+
+remove_one() {
+  local target="$1" entry name path icon
+  entry="$(find_entry "$target")" || die "$(basename "$target") is not installed"
+  name="$(desktop_get "$entry" Name)"
+  path="$(desktop_get "$entry" X-AppImage-Path)"
+  icon="$(desktop_get "$entry" Icon)"
+
+  if ((CONFIRM)); then
+    local question="Uninstall $name?"
+    ((KEEP_FILE)) || question+=$'\n\nThe AppImage will be moved to the trash.'
+    if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && command -v zenity >/dev/null; then
+      zenity --question --title="Uninstall $name" --icon="${icon:-dialog-question}" \
+        --ok-label="Uninstall" --cancel-label="Cancel" --text="$question" 2>/dev/null || exit 0
+    elif [[ -t 0 ]]; then
+      read -rp "$question [y/N] " reply
+      [[ "${reply,,}" == y* ]] || exit 0
+    fi
+  fi
+
+  rm -f "$entry"
+  [[ "$icon" == "$ICON_DIR"/* ]] && rm -f "$icon"
+  if ((! KEEP_FILE)) && [[ -f "$path" ]]; then
+    gio trash "$path" 2>/dev/null || rm -f "$path"
+  fi
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$DESKTOP_DIR" 2>/dev/null || true
+
+  ok "Removed ${B}$name${N}"
+  notify normal user-trash "$name uninstalled" \
+    "$( ((KEEP_FILE)) && echo "The AppImage file was kept." || echo "The AppImage was moved to the trash.")"
+}
+
+# ------------------------------------------------------------- list/info ---
+
+list_installed() {
+  local f found=0
+  printf '%s%-28s %-12s %s%s\n' "$B" "NAME" "VERSION" "FILE" "$N"
+  for f in "$DESKTOP_DIR"/"$PREFIX"*.desktop; do
+    [[ -f "$f" ]] && grep -qx "$MARKER" "$f" || continue
+    found=1
+    printf '%-28s %-12s %s\n' "$(desktop_get "$f" Name)" \
+      "$(desktop_get "$f" X-AppImage-Version || true)" "$(desktop_get "$f" X-AppImage-Path)"
+  done
+  ((found)) || printf '%s(nothing installed yet)%s\n' "$D" "$N"
+}
+
+show_info() {
+  local real work desktop icon entry
+  real="$(readlink -f "$1")"
+  is_appimage "$real" || die "$(basename "$1") is not an AppImage"
+  chmod +x "$real"
+  work="$(mktemp -d)"; WORKDIRS+=("$work")
+  IFS='|' read -r desktop icon < <(extract_metadata "$real" "$work")
+  printf '%sName%s      %s\n' "$B" "$N" "$(desktop_get "$desktop" Name || true)"
+  printf '%sVersion%s   %s\n' "$B" "$N" "$(v="$(desktop_get "$desktop" X-AppImage-Version)"; echo "${v:-$(version_from_filename "$real")}")"
+  printf '%sComment%s   %s\n' "$B" "$N" "$(desktop_get "$desktop" Comment || true)"
+  printf '%sSize%s      %s\n' "$B" "$N" "$(du -h "$real" | cut -f1)"
+  if entry="$(find_entry "$real")"; then
+    printf '%sStatus%s    %sinstalled%s (%s)\n' "$B" "$N" "$G" "$N" "$entry"
+  else
+    printf '%sStatus%s    not installed\n' "$B" "$N"
+  fi
+}
+
+# ------------------------------------------------------------------ main ---
+
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 1; }
+  shift
+  case "$cmd" in
+    -h|--help|help) usage; exit 0 ;;
+    -v|--version) echo "appimage-integrator $VERSION"; exit 0 ;;
+  esac
+
+  local args=()
+  if [[ "$cmd" == run ]]; then
+    [[ $# -ge 1 ]] || die "Usage: appimage-integrator run <file.AppImage> [args...]"
+    chmod +x "$1"; exec "$(readlink -f "$1")" "${@:2}"
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --notify) NOTIFY=1 ;;
+      --confirm) CONFIRM=1 ;;
+      --copy) COPY=1 ;;
+      --keep-file) KEEP_FILE=1 ;;
+      --) shift; args+=("$@"); break ;;
+      -*) die "Unknown option: $1" ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+
+  case "$cmd" in
+    install|i|add)
+      [[ ${#args[@]} -gt 0 ]] || die "Give me at least one .AppImage file"
+      for f in "${args[@]}"; do install_one "$f"; done ;;
+    remove|uninstall|rm)
+      [[ ${#args[@]} -gt 0 ]] || die "Give me an installed AppImage file or app name"
+      for f in "${args[@]}"; do remove_one "$f"; done ;;
+    list|ls) list_installed ;;
+    info) [[ ${#args[@]} -eq 1 ]] || die "Usage: appimage-integrator info <file.AppImage>"; show_info "${args[0]}" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
